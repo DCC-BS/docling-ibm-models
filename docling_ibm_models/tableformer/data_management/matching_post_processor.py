@@ -5,9 +5,37 @@ import statistics
 
 import docling_ibm_models.tableformer.settings as s
 from docling_ibm_models.tableformer.data_management.tf_cell_matcher import CellMatcher
+from docling_ibm_models.tableformer.dcc_flags import on as _dcc_on
 
 LOG_LEVEL = logging.INFO
 # LOG_LEVEL = logging.DEBUG
+
+
+def _string_keys(matches):
+    r"""
+    What json.loads(json.dumps(matches)) gives for matches with int keys and
+    match dicts of str keys and int/finite float values (None otherwise): the
+    keys as strings and copies of the match dicts (floats round-trip exactly).
+    """
+    out = {}
+    for key, match_list in matches.items():
+        if type(key) is not int:
+            return None
+        new_list = []
+        for m in match_list:
+            if type(m) is not dict:
+                return None
+            for k, v in m.items():
+                if type(k) is not str:
+                    return None
+                if type(v) is float:
+                    if not math.isfinite(v):
+                        return None
+                elif type(v) is not int:
+                    return None
+            new_list.append(dict(m))
+        out[str(key)] = new_list
+    return out
 
 
 class MatchingPostProcessor:
@@ -80,6 +108,8 @@ class MatchingPostProcessor:
         bad_table_cells : list of dict
             cells in a column that don't have match
         """
+        if _dcc_on("MATCH"):
+            return self._get_good_bad_cells_in_column_fast(table_cells, column, matches)
         good_table_cells = []
         bad_table_cells = []
 
@@ -109,6 +139,36 @@ class MatchingPostProcessor:
                 if bad_match:
                     bad_table_cells.append(cell)
 
+        return good_table_cells, bad_table_cells
+
+    def _get_good_bad_cells_in_column_fast(self, table_cells, column, matches):
+        r"""
+        _get_good_bad_cells_in_column with the matches counted once: a cell is
+        appended to the good cells once per match that points to it (as the loop
+        over all matches does), unless its class is <= 1.
+        """
+        key = id(matches)
+        cache = getattr(self, "_dcc_match_count", None)
+        if cache is None or cache[0] != key or cache[1] is not matches:
+            counts = {}
+            for match_list in matches.values():
+                for match in match_list:
+                    tid = match["table_cell_id"]
+                    counts[tid] = counts.get(tid, 0) + 1
+            cache = (key, matches, counts)
+            self._dcc_match_count = cache
+        counts = cache[2]
+        good_table_cells = []
+        bad_table_cells = []
+        for cell in table_cells:
+            if cell["column_id"] == column:
+                n = 0
+                if matches and not ("cell_class" in cell and cell["cell_class"] <= 1):
+                    n = counts.get(cell["cell_id"], 0)
+                if n:
+                    good_table_cells.extend([cell] * n)
+                else:
+                    bad_table_cells.append(cell)
         return good_table_cells, bad_table_cells
 
     def _delete_column_from_table(self, table_cells, column):
@@ -379,6 +439,10 @@ class MatchingPostProcessor:
             table_cells, pdf_cells
         )
         clean_matches = new_matches
+        if _dcc_on("MATCH"):
+            fast = _string_keys(clean_matches)
+            if fast is not None:
+                return fast
         # Convert to JSON and back to have string keys in the dictionary
         clean_matches_string = json.dumps(clean_matches)
         clean_matches = json.loads(clean_matches_string)
@@ -561,6 +625,10 @@ class MatchingPostProcessor:
         new_tab_columns : integer
             New number of table columns
         """
+        if _dcc_on("MATCH"):
+            return self._deduplicate_cells_fast(
+                tab_columns, table_cells, iou_matches, ioc_matches
+            )
         pdf_cells_in_columns = []
         total_score_in_columns = []
 
@@ -673,6 +741,84 @@ class MatchingPostProcessor:
             if len(new_cell_match) > 0:
                 new_matches[pdf_cell_id] = new_cell_match
 
+        return new_table_cells, new_matches, new_tab_columns
+
+    def _deduplicate_cells_fast(self, tab_columns, table_cells, iou_matches, ioc_matches):
+        r"""
+        _deduplicate_cells with one pass over the matches instead of one per column.
+        The scores of every column are summed in the same order as there.
+        """
+        cols_of_cell = {}
+        for cell in table_cells:
+            col = cell["column_id"]
+            if isinstance(col, int) and 0 <= col < tab_columns:
+                cols = cols_of_cell.setdefault(cell["cell_id"], [])
+                if col not in cols:
+                    cols.append(col)
+        iou_score = [0] * tab_columns
+        ioc_score = [0] * tab_columns
+        pdf_iou = [[] for _ in range(tab_columns)]
+        pdf_ioc = [[] for _ in range(tab_columns)]
+        for iou_key, iou_match_list in iou_matches.items():
+            for m in iou_match_list:
+                for col in cols_of_cell.get(m["table_cell_id"], ()):
+                    if "iou" in m:
+                        iou_score[col] += m["iou"]
+                    elif "iopdf" in m:
+                        iou_score[col] += m["iopdf"]
+                    pdf_iou[col].append(iou_key)
+        for ioc_key, ioc_match_list in ioc_matches.items():
+            for m in ioc_match_list:
+                for col in cols_of_cell.get(m["table_cell_id"], ()):
+                    ioc_score[col] += m["iopdf"]
+                    pdf_ioc[col].append(ioc_key)
+
+        pdf_cells_in_columns = []
+        total_score_in_columns = []
+        for col in range(tab_columns):
+            column_pdf_cells = pdf_iou[col]
+            column_pdf_cells += list(set(pdf_ioc[col]) - set(pdf_iou[col]))
+            pdf_cells_in_columns.append(column_pdf_cells)
+            total_score_in_columns.append(iou_score[col] + ioc_score[col])
+
+        pdf_cells_in_columns = [
+            list(set([x for x in map(lambda x: int(x), le)]))
+            for le in pdf_cells_in_columns
+        ]
+        cols_to_eliminate = []
+        for cl in range(tab_columns - 1):
+            col_a = pdf_cells_in_columns[cl]
+            col_b = pdf_cells_in_columns[cl + 1]
+            score_a = total_score_in_columns[cl]
+            score_b = total_score_in_columns[cl + 1]
+            intsct = list(set(col_a).intersection(col_b))
+            int_prc = 0
+            if len(col_a) > 0:
+                int_prc = len(intsct) / len(col_a)
+            if int_prc > 0.6:
+                if score_a >= score_b:
+                    cols_to_eliminate.append(cl + 1)
+                if score_b > score_a:
+                    cols_to_eliminate.append(cl)
+
+        new_table_cells = []
+        new_matches = {}
+        removed_table_cell_ids = set()
+        new_tab_columns = tab_columns - len(cols_to_eliminate)
+        eliminate = set(cols_to_eliminate)
+        for tab_cell in table_cells:
+            if tab_cell["column_id"] in eliminate:
+                removed_table_cell_ids.add(tab_cell["cell_id"])
+            else:
+                new_table_cells.append(tab_cell)
+        for pdf_cell_id, pdf_cell_matches in ioc_matches.items():
+            new_cell_match = [
+                m
+                for m in pdf_cell_matches
+                if m["table_cell_id"] not in removed_table_cell_ids
+            ]
+            if len(new_cell_match) > 0:
+                new_matches[pdf_cell_id] = new_cell_match
         return new_table_cells, new_matches, new_tab_columns
 
     def _do_final_asignment(self, table_cells, iou_matches, ioc_matches):
@@ -1242,6 +1388,26 @@ class MatchingPostProcessor:
             )
         return new_matches, new_table_cells, max_cell_id
 
+    def _log_final_matches(self, final_matches_wo, table_cells_wo):
+        for pdf_cell_id in range(len(final_matches_wo)):
+            if str(pdf_cell_id) in final_matches_wo:
+                pdf_cell_match = final_matches_wo[str(pdf_cell_id)]
+                if len(pdf_cell_match) > 1:
+                    l1 = "!!! Multiple - {}x pdf cell match with id: {}"
+                    self._log().info(l1.format(len(pdf_cell_match), pdf_cell_id))
+                if pdf_cell_match:
+                    tcellid = pdf_cell_match[0]["table_cell_id"]
+                    for tcell in table_cells_wo:
+                        if tcell["cell_id"] == tcellid:
+                            mrow = tcell["row_id"]
+                            mcol = tcell["column_id"]
+                            l2 = "pdf cell: {} -> row: {} | col:{}"
+                            self._log().debug(l2.format(pdf_cell_id, mrow, mcol))
+            else:
+                self._log().debug(
+                    "!!! pdf cell doesn't have match: {}".format(pdf_cell_id)
+                )
+
     def _clear_pdf_cells(self, pdf_cells):
         r"""
         Clean PDF cells from cells that have an empty string as text
@@ -1330,6 +1496,7 @@ class MatchingPostProcessor:
         # of other cells in a minimal-grid column
 
         self._log().debug("Start prediction post-processing...")
+        self._dcc_match_count = None
         table_cells = matching_details["table_cells"]
         pdf_cells = self._clear_pdf_cells(matching_details["pdf_cells"])
         matches = matching_details["matches"]
@@ -1476,24 +1643,16 @@ class MatchingPostProcessor:
         self._log().debug("*** table_cells_wo")
         self._log().debug(table_cells_wo)
 
-        for pdf_cell_id in range(len(final_matches_wo)):
-            if str(pdf_cell_id) in final_matches_wo:
-                pdf_cell_match = final_matches_wo[str(pdf_cell_id)]
-                if len(pdf_cell_match) > 1:
+        if _dcc_on("MATCH") and not self._log().isEnabledFor(logging.DEBUG):
+            # Only the info line of the loop below: its table cell lookup is
+            # for the debug lines
+            for pdf_cell_id in range(len(final_matches_wo)):
+                pdf_cell_match = final_matches_wo.get(str(pdf_cell_id))
+                if pdf_cell_match is not None and len(pdf_cell_match) > 1:
                     l1 = "!!! Multiple - {}x pdf cell match with id: {}"
                     self._log().info(l1.format(len(pdf_cell_match), pdf_cell_id))
-                if pdf_cell_match:
-                    tcellid = pdf_cell_match[0]["table_cell_id"]
-                    for tcell in table_cells_wo:
-                        if tcell["cell_id"] == tcellid:
-                            mrow = tcell["row_id"]
-                            mcol = tcell["column_id"]
-                            l2 = "pdf cell: {} -> row: {} | col:{}"
-                            self._log().debug(l2.format(pdf_cell_id, mrow, mcol))
-            else:
-                self._log().debug(
-                    "!!! pdf cell doesn't have match: {}".format(pdf_cell_id)
-                )
+        else:
+            self._log_final_matches(final_matches_wo, table_cells_wo)
 
         # Example of an object:
         # matching_details = {

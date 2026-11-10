@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 import torch.nn as nn
@@ -13,6 +14,7 @@ from docling_ibm_models.tableformer.models.table04_rs.tag_decoder_rs import (
 from docling_ibm_models.tableformer.models.table04_rs.transformer_rs import (
     Tag_Transformer,
 )
+from docling_ibm_models.tableformer.dcc_flags import on as _dcc_on
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
 LOG_LEVEL = logging.WARN
@@ -154,7 +156,9 @@ class TableModel04_rs(BaseModel, nn.Module):
         self._tag_transformer.eval()
         max_steps = min(max_steps, self._max_pred_len)
         if self._tag_decoders is None:
-            self._tag_decoders = TagDecoders(self, self._max_pred_len)
+            # DCC_TABLES_MAXB: tables decoded together (default 4, as before)
+            maxb = int(os.environ.get("DCC_TABLES_MAXB", "4") or 4)
+            self._tag_decoders = TagDecoders(self, self._max_pred_len, maxb)
         decoders = self._tag_decoders
 
         results = []
@@ -229,6 +233,12 @@ class TableModel04_rs(BaseModel, nn.Module):
         # Merge First and Last predicted BBOX for each span, according to bboxes_to_merge
         ########################################################################################
 
+        if _dcc_on("DECODER"):
+            outputs_class1, outputs_coord1 = self._merge_span_bboxes(
+                outputs_class, outputs_coord, bboxes_to_merge
+            )
+            return seq, outputs_class1, outputs_coord1
+
         outputs_class1 = []
         outputs_coord1 = []
         boxes_to_skip = []
@@ -262,6 +272,47 @@ class TableModel04_rs(BaseModel, nn.Module):
             "OTSL predicted table cells#: {}; rows#: {}".format(num_tab_cells, num_rows)
         )
         return seq, outputs_class1, outputs_coord1
+
+    def _merge_span_bboxes(self, outputs_class, outputs_coord, bboxes_to_merge):
+        r"""
+        The merge loop of _table_output with two gathers instead of per box tensor
+        ops: the same boxes in the same order, merged with the same float32
+        operations as mergebboxes.
+        """
+        n = len(outputs_coord)
+        keep, partner = [], []
+        skip = set()
+        for box_ind in range(n):
+            if box_ind in bboxes_to_merge:
+                j = bboxes_to_merge[box_ind]
+                skip.add(j)
+                keep.append(box_ind)
+                partner.append(j)
+            elif box_ind not in skip:
+                keep.append(box_ind)
+                partner.append(None)
+        if not keep:
+            return torch.empty(0), torch.empty(0)
+        dev = outputs_coord.device
+        idx = torch.tensor(keep, device=dev)
+        coord = outputs_coord[idx].to(self._device)
+        cls = outputs_class[idx].to(self._device)
+        merged_rows = [k for k, j in enumerate(partner) if j is not None]
+        if merged_rows:
+            rows = torch.tensor(merged_rows, device=coord.device)
+            b1 = coord[rows]
+            b2 = outputs_coord[
+                torch.tensor([partner[k] for k in merged_rows], device=dev)
+            ].to(coord.device)
+            new_w = (b2[:, 0] + b2[:, 2] / 2) - (b1[:, 0] - b1[:, 2] / 2)
+            new_h = (b2[:, 1] + b2[:, 3] / 2) - (b1[:, 1] - b1[:, 3] / 2)
+            new_left = b1[:, 0] - b1[:, 2] / 2
+            new_top = torch.minimum(b2[:, 1] - b2[:, 3] / 2, b1[:, 1] - b1[:, 3] / 2)
+            new_cx = new_left + new_w / 2
+            new_cy = new_top + new_h / 2
+            coord = coord.clone()
+            coord[rows] = torch.stack([new_cx, new_cy, new_w, new_h], dim=1)
+        return cls, coord
 
     @staticmethod
     def _cell_steps(tags, word_map):

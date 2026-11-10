@@ -1,6 +1,7 @@
 import glob
 import json
 import logging
+import math
 import os
 import threading
 from bisect import bisect_left
@@ -24,6 +25,7 @@ from docling_ibm_models.tableformer.models.common.base_model import BaseModel
 from docling_ibm_models.tableformer.models.table04_rs.tablemodel04_rs import (
     TableModel04_rs,
 )
+from docling_ibm_models.tableformer.dcc_flags import on as _dcc_on
 from docling_ibm_models.tableformer.otsl import otsl_to_html
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
@@ -84,6 +86,36 @@ def otsl_sqr_chk(rs_list, logdebug):
                     )
                 )
     return isSquare
+
+
+def _resized_crop(page_image, rows: slice, cols: slice):
+    r"""
+    page_image resized to height 1024 with INTER_AREA as TFPredictor.resize_img
+    does, cropped to [rows, cols], resizing only the rows needed (DCC_TABLES_RESIZE).
+
+    The vertical scale h / 1024 is a dyadic rational, so source row
+    k * h / g and output row k * 1024 / g (g = gcd(h, 1024)) are both integers:
+    a band of whole such blocks resized on its own has exactly the area weights
+    of the full resize (same scale, same cell offsets; at the band's end the
+    clamped last row gets the same weight as the full row it replaces).
+    """
+    h, w = page_image.shape[:2]
+    out_w = int(w * (1024 / float(h)))
+    start, stop, _ = rows.indices(1024)
+    g = math.gcd(h, 1024)
+    block_out, block_src = 1024 // g, h // g
+    if stop <= start or g == 1:
+        resized = cv2.resize(page_image, (out_w, 1024), interpolation=cv2.INTER_AREA)
+        return resized[rows, cols]
+    k0 = start // block_out
+    k1 = -(-stop // block_out)
+    band = cv2.resize(
+        page_image[k0 * block_src : k1 * block_src],
+        (out_w, (k1 - k0) * block_out),
+        interpolation=cv2.INTER_AREA,
+    )
+    off = k0 * block_out
+    return band[start - off : stop - off, cols]
 
 
 class TFPredictor:
@@ -380,24 +412,31 @@ class TFPredictor:
         tf_output = []
         tf_cells_map = {}
         max_row_idx = 0
+        if _dcc_on("MATCH"):
+            # pdf cells by id, in list order: the same cells as the scans below
+            by_id = {}
+            for pdf_cell in pdf_cells:
+                by_id.setdefault(pdf_cell["id"], []).append(pdf_cell)
+            pdf_cells_of = lambda cell_id: by_id.get(cell_id, ())  # noqa: E731
+        else:
+            pdf_cells_of = lambda cell_id: (  # noqa: E731
+                c for c in pdf_cells if c["id"] == cell_id
+            )
 
         for docling_item in docling_output:
             r_idx = str(docling_item["start_row_offset_idx"])
             c_idx = str(docling_item["start_col_offset_idx"])
             cell_key = c_idx + "_" + r_idx
             if cell_key in tf_cells_map:
-                for pdf_cell in pdf_cells:
-                    if pdf_cell["id"] == docling_item["cell_id"]:
-                        text_cell_bbox = {
-                            "b": pdf_cell["bbox"][3],
-                            "l": pdf_cell["bbox"][0],
-                            "r": pdf_cell["bbox"][2],
-                            "t": pdf_cell["bbox"][1],
-                            "token": pdf_cell["text"],
-                        }
-                        tf_cells_map[cell_key]["text_cell_bboxes"].append(
-                            text_cell_bbox
-                        )
+                for pdf_cell in pdf_cells_of(docling_item["cell_id"]):
+                    text_cell_bbox = {
+                        "b": pdf_cell["bbox"][3],
+                        "l": pdf_cell["bbox"][0],
+                        "r": pdf_cell["bbox"][2],
+                        "t": pdf_cell["bbox"][1],
+                        "token": pdf_cell["text"],
+                    }
+                    tf_cells_map[cell_key]["text_cell_bboxes"].append(text_cell_bbox)
             else:
                 tf_cells_map[cell_key] = {
                     "bbox": docling_item["bbox"],
@@ -417,18 +456,15 @@ class TFPredictor:
                 if docling_item["start_row_offset_idx"] > max_row_idx:
                     max_row_idx = docling_item["start_row_offset_idx"]
 
-                for pdf_cell in pdf_cells:
-                    if pdf_cell["id"] == docling_item["cell_id"]:
-                        text_cell_bbox = {
-                            "b": pdf_cell["bbox"][3],
-                            "l": pdf_cell["bbox"][0],
-                            "r": pdf_cell["bbox"][2],
-                            "t": pdf_cell["bbox"][1],
-                            "token": pdf_cell["text"],
-                        }
-                        tf_cells_map[cell_key]["text_cell_bboxes"].append(
-                            text_cell_bbox
-                        )
+                for pdf_cell in pdf_cells_of(docling_item["cell_id"]):
+                    text_cell_bbox = {
+                        "b": pdf_cell["bbox"][3],
+                        "l": pdf_cell["bbox"][0],
+                        "r": pdf_cell["bbox"][2],
+                        "t": pdf_cell["bbox"][1],
+                        "token": pdf_cell["text"],
+                    }
+                    tf_cells_map[cell_key]["text_cell_bboxes"].append(text_cell_bbox)
 
         for k in tf_cells_map:
             tf_output.append(tf_cells_map[k])
@@ -532,9 +568,17 @@ class TFPredictor:
         multi_tf_output = []
         page_image = iocr_page["image"]
 
-        # Prevent large image submission, by resizing input
-        page_image_resized, scale_factor = self.resize_img(page_image, height=1024)
+        bands = _dcc_on("RESIZE")
+        if bands:
+            # (DCC_TABLES_RESIZE) resize only the rows of each table, see _resized_crop
+            scale_factor = 1024 / float(page_image.shape[0])
+        else:
+            # Prevent large image submission, by resizing input
+            page_image_resized, scale_factor = self.resize_img(
+                page_image, height=1024
+            )
 
+        table_images = []
         for table_bbox in table_bboxes:
             # Downscale table bounding box to the size of new image
             table_bbox[0] = table_bbox[0] * scale_factor
@@ -542,11 +586,19 @@ class TFPredictor:
             table_bbox[2] = table_bbox[2] * scale_factor
             table_bbox[3] = table_bbox[3] * scale_factor
 
-            table_image = page_image_resized[
-                round(table_bbox[1]) : round(table_bbox[3]),
-                round(table_bbox[0]) : round(table_bbox[2]),
-            ]
-            # table_image = page_image
+            rows = slice(round(table_bbox[1]), round(table_bbox[3]))
+            cols = slice(round(table_bbox[0]), round(table_bbox[2]))
+            if bands:
+                table_images.append(_resized_crop(page_image, rows, cols))
+            else:
+                table_images.append(page_image_resized[rows, cols])
+
+        # Run the model on all tables of the page at once
+        model_outputs = self._predict_tables(table_images)
+
+        for table_bbox, table_image, model_output in zip(
+            table_bboxes, table_images, model_outputs
+        ):
             # Predict
             if do_matching:
                 tf_responses, predict_details = self.predict(
@@ -556,10 +608,16 @@ class TFPredictor:
                     scale_factor,
                     None,
                     correct_overlapping_cells,
+                    model_output=model_output,
                 )
             else:
                 tf_responses, predict_details = self.predict_dummy(
-                    iocr_page, table_bbox, table_image, scale_factor, None
+                    iocr_page,
+                    table_bbox,
+                    table_image,
+                    scale_factor,
+                    None,
+                    model_output=model_output,
                 )
 
             # ======================================================================================
@@ -588,8 +646,126 @@ class TFPredictor:
         # Return grouped results of predictions
         return multi_tf_output
 
+    def multi_page_predict(
+        self,
+        requests,
+        do_matching=True,
+        correct_overlapping_cells=False,
+        sort_row_col_indexes=True,
+    ):
+        r"""
+        multi_table_predict for the tables of several pages (or several calls with
+        their own tokens) at once: every page image is resized once, and the model
+        runs on all table crops together (batched decoding).
+
+        Parameters
+        ----------
+        requests : list of (iocr_page, table_bboxes)
+            As the arguments of multi_table_predict. Pages that share the same
+            image array are resized once.
+
+        Returns
+        -------
+        list of the multi_table_predict results, one per request
+        """
+        resized = {}
+        bands = _dcc_on("RESIZE")
+        jobs = []  # (request index, iocr_page, table_bbox, table_image, scale_factor)
+        for r, (iocr_page, table_bboxes) in enumerate(requests):
+            page_image = iocr_page["image"]
+            key = id(page_image)
+            if bands:
+                scale_factor = 1024 / float(page_image.shape[0])
+            else:
+                if key not in resized:
+                    resized[key] = (
+                        page_image,
+                        self.resize_img(page_image, height=1024),
+                    )
+                page_image_resized, scale_factor = resized[key][1]
+            for table_bbox in table_bboxes:
+                table_bbox[0] = table_bbox[0] * scale_factor
+                table_bbox[1] = table_bbox[1] * scale_factor
+                table_bbox[2] = table_bbox[2] * scale_factor
+                table_bbox[3] = table_bbox[3] * scale_factor
+                rows = slice(round(table_bbox[1]), round(table_bbox[3]))
+                cols = slice(round(table_bbox[0]), round(table_bbox[2]))
+                if bands:
+                    table_image = _resized_crop(page_image, rows, cols)
+                else:
+                    table_image = page_image_resized[rows, cols]
+                jobs.append((r, iocr_page, table_bbox, table_image, scale_factor))
+
+        model_outputs = self._predict_tables([j[3] for j in jobs])
+
+        results = [[] for _ in requests]
+        for (r, iocr_page, table_bbox, table_image, scale_factor), model_output in zip(
+            jobs, model_outputs
+        ):
+            if do_matching:
+                tf_responses, predict_details = self.predict(
+                    iocr_page,
+                    table_bbox,
+                    table_image,
+                    scale_factor,
+                    None,
+                    correct_overlapping_cells,
+                    model_output=model_output,
+                )
+            else:
+                tf_responses, predict_details = self.predict_dummy(
+                    iocr_page,
+                    table_bbox,
+                    table_image,
+                    scale_factor,
+                    None,
+                    model_output=model_output,
+                )
+            if sort_row_col_indexes:
+                num_cols, num_rows = self._compress_row_col_indexes(tf_responses)
+                predict_details["num_cols"] = num_cols
+                predict_details["num_rows"] = num_rows
+            else:
+                otsl_seq = predict_details["prediction"]["rs_seq"]
+                predict_details["num_cols"] = otsl_seq.index("nl")
+                predict_details["num_rows"] = otsl_seq.count("nl")
+            results[r].append(
+                {"tf_responses": tf_responses, "predict_details": predict_details}
+            )
+            table_bbox[0] = table_bbox[0] / scale_factor
+            table_bbox[1] = table_bbox[1] / scale_factor
+            table_bbox[2] = table_bbox[2] / scale_factor
+            table_bbox[3] = table_bbox[3] / scale_factor
+        return results
+
+    def _predict_tables(self, table_images):
+        r"""
+        Run the model on several table images at once
+
+        Parameters
+        ----------
+        table_images : list of cv2.Mat
+            The table crops
+
+        Returns
+        -------
+        list of (pred_tag_seq, outputs_class, outputs_coord), one per table
+        """
+        if len(table_images) == 0:
+            return []
+        max_steps = self._config["predict"]["max_steps"]
+        image_batch = torch.cat([self._prepare_image(img) for img in table_images])
+        with torch.no_grad():
+            return self._model.predict_batch(image_batch, max_steps)
+
     def predict_dummy(
-        self, iocr_page, table_bbox, table_image, scale_factor, eval_res_preds=None
+        self,
+        iocr_page,
+        table_bbox,
+        table_image,
+        scale_factor,
+        eval_res_preds=None,
+        model_output=None,
     ):
         r"""
         Predict the table out of an image in memory
@@ -600,6 +776,8 @@ class TFPredictor:
             Docling provided table data
         eval_res_preds : dict
             Ready predictions provided by the evaluation results
+        model_output : tuple
+            Ready output of the model for this table (from _predict_tables)
 
         Returns
         -------
@@ -611,9 +789,6 @@ class TFPredictor:
         """
         AggProfiler().start_agg(self._prof)
 
-        max_steps = self._config["predict"]["max_steps"]
-        beam_size = self._config["predict"]["beam_size"]
-        image_batch = self._prepare_image(table_image)
         # Make predictions
         prediction = {}
 
@@ -625,8 +800,8 @@ class TFPredictor:
                 prediction["bboxes"] = eval_res_preds["bboxes"]
                 pred_tag_seq = eval_res_preds["tag_seq"]
             elif self._config["predict"]["bbox"]:
-                pred_tag_seq, outputs_class, outputs_coord = self._model.predict(
-                    image_batch, max_steps, beam_size
+                pred_tag_seq, outputs_class, outputs_coord = (
+                    model_output or self._predict_tables([table_image])[0]
                 )
 
                 if outputs_coord is not None:
@@ -649,8 +824,8 @@ class TFPredictor:
                 if self._remove_padding:
                     pred_tag_seq, _ = u.remove_padding(pred_tag_seq)
             else:
-                pred_tag_seq, _, _ = self._model.predict(
-                    image_batch, max_steps, beam_size
+                pred_tag_seq, _, _ = (
+                    model_output or self._predict_tables([table_image])[0]
                 )
                 # Check if padding should be removed
                 if self._remove_padding:
@@ -719,6 +894,7 @@ class TFPredictor:
         scale_factor,
         eval_res_preds=None,
         correct_overlapping_cells=False,
+        model_output=None,
     ):
         r"""
         Predict the table out of an image in memory
@@ -729,6 +905,8 @@ class TFPredictor:
             Docling provided table data
         eval_res_preds : dict
             Ready predictions provided by the evaluation results
+        model_output : tuple
+            Ready output of the model for this table (from _predict_tables)
         correct_overlapping_cells : boolean
             Enables or disables last post-processing step, that fixes cell bboxes to remove overlap
 
@@ -742,9 +920,6 @@ class TFPredictor:
         """
         AggProfiler().start_agg(self._prof)
 
-        max_steps = self._config["predict"]["max_steps"]
-        beam_size = self._config["predict"]["beam_size"]
-        image_batch = self._prepare_image(table_image)
         # Make predictions
         prediction = {}
 
@@ -756,8 +931,8 @@ class TFPredictor:
                 prediction["bboxes"] = eval_res_preds["bboxes"]
                 pred_tag_seq = eval_res_preds["tag_seq"]
             elif self._config["predict"]["bbox"]:
-                pred_tag_seq, outputs_class, outputs_coord = self._model.predict(
-                    image_batch, max_steps, beam_size
+                pred_tag_seq, outputs_class, outputs_coord = (
+                    model_output or self._predict_tables([table_image])[0]
                 )
 
                 if outputs_coord is not None:
@@ -780,8 +955,8 @@ class TFPredictor:
                 if self._remove_padding:
                     pred_tag_seq, _ = u.remove_padding(pred_tag_seq)
             else:
-                pred_tag_seq, _, _ = self._model.predict(
-                    image_batch, max_steps, beam_size
+                pred_tag_seq, _, _ = (
+                    model_output or self._predict_tables([table_image])[0]
                 )
                 # Check if padding should be removed
                 if self._remove_padding:
@@ -925,6 +1100,12 @@ class TFPredictor:
 
         # format output to look similar to tests/examples/tf_gte_output_2.json
         tf_cell_list = []
+        first_cell = None
+        if _dcc_on("MATCH"):
+            # The first table cell of every cell_id, as the filter below picks
+            first_cell = {}
+            for table_cell in table_cells:
+                first_cell.setdefault(table_cell["cell_id"], table_cell)
         for pdf_cell_id, pdf_cell_matches in matches.items():
             tf_cell = {
                 "bbox": {},  # b,l,r,t,token
@@ -949,9 +1130,14 @@ class TFPredictor:
 
             for match in pdf_cell_matches:
                 tm = match["table_cell_id"]
-                tcl = list(
-                    filter(lambda table_cell: table_cell["cell_id"] == tm, table_cells)
-                )
+                if first_cell is not None:
+                    tcl = [first_cell[tm]] if tm in first_cell else []
+                else:
+                    tcl = list(
+                        filter(
+                            lambda table_cell: table_cell["cell_id"] == tm, table_cells
+                        )
+                    )
                 if len(tcl) > 0:
                     table_cell = tcl[0]
                     row_ids.add(table_cell["row_id"])
@@ -1021,7 +1207,20 @@ class TFPredictor:
         resized_size = self._config["dataset"]["resized_image"]
         resize = T.Resize([resized_size, resized_size])
 
-        img, _ = normalize(mat_image, None)
+        mean = self._config["dataset"]["image_normalization"]["mean"]
+        std = self._config["dataset"]["image_normalization"]["std"]
+        if (
+            _dcc_on("PREP")
+            and isinstance(mat_image, np.ndarray)
+            and mat_image.dtype == np.uint8
+            and mat_image.ndim == 3
+            and mat_image.shape[2] == len(mean) == len(std) <= 4
+        ):
+            # (DCC_TABLES_PREP) Normalise with a lookup table of the 256 values per
+            # channel, computed with the same operations as T.Normalize
+            img = cv2.LUT(np.ascontiguousarray(mat_image), self._norm_lut(mean, std))
+        else:
+            img, _ = normalize(mat_image, None)
         img, _ = resize(img, None)
 
         img = img.transpose(2, 1, 0)  # (channels, width, height)
@@ -1029,6 +1228,22 @@ class TFPredictor:
         image_batch = img.unsqueeze(dim=0)
         image_batch = image_batch.to(device=self._device)
         return image_batch
+
+    def _norm_lut(self, mean, std):
+        key = (tuple(mean), tuple(std))
+        cached = getattr(self, "_dcc_norm_lut", None)
+        if cached is None or cached[0] != key:
+            values = np.arange(256, dtype=np.float32)
+            lut = np.stack(
+                [
+                    (values - 255.0 * np.array(mean)[k]) / np.array(std)[k]
+                    for k in range(len(mean))
+                ],
+                axis=1,
+            ).reshape(1, 256, len(mean))
+            cached = (key, lut)
+            self._dcc_norm_lut = cached
+        return cached[1]
 
     def _get_html_tags(self, seq):
         r"""

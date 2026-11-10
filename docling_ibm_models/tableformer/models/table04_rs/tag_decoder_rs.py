@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from docling_ibm_models.tableformer.dcc_flags import on as _dcc_on
+
 
 def _attend_one(q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None):
     r"""
@@ -78,7 +80,17 @@ class TagDecoder:
         self._all_finished = zeros(1, dtype=torch.bool)
         self._pe = tt._positional_encoding.pe  # (max_len, 1, E)
 
-        self._graph = None
+        # Self-attention only reads the first L cache slots while the step is below
+        # L: one step function (and CUDA graph) per cache length bucket, so short
+        # tables do not pay for attention over the whole max_steps cache
+        # (DCC_TABLES_DECODER; off: one bucket of max_steps, the original decoder)
+        self._fast = _dcc_on("DECODER")
+        if self._fast:
+            self._buckets = sorted({min(b, T) for b in (64, 128, 256, 512)} | {T})
+        else:
+            self._buckets = [T]
+        self._chunk = 8  # steps per graph replay with DCC_TABLES_DECODER
+        self._graphs = None
         if use_cuda_graph and device.type == "cuda":
             self._capture()
 
@@ -101,13 +113,14 @@ class TagDecoder:
             1, self._B, self._E
         )
 
-    def _step(self):
+    def _step(self, L: int):
         r"""
-        One decoding step on the static buffers (same layers as TMTransformerDecoder).
+        One decoding step on the static buffers (same layers as TMTransformerDecoder),
+        valid while the step index is below the cache length L.
         """
         E, t = self._E, self._t
         q_part, kv_part = slice(0, E), slice(E, 3 * E)
-        mask = (self._positions <= t).view(1, 1, 1, self._T)
+        mask = (self._positions[:L] <= t).view(1, 1, 1, L)
         h = self._x
         for i, layer in enumerate(self._layers):
             sa = layer.self_attn
@@ -115,7 +128,9 @@ class TagDecoder:
             kv = self._project(sa, h, kv_part).view(1, self._B, 2, self._H, self._hd)
             self._k_cache[i].index_copy_(2, t, kv[:, :, 0].permute(1, 2, 0, 3))
             self._v_cache[i].index_copy_(2, t, kv[:, :, 1].permute(1, 2, 0, 3))
-            a = _attend_one(q, self._k_cache[i], self._v_cache[i], mask)
+            a = _attend_one(
+                q, self._k_cache[i][:, :, :L], self._v_cache[i][:, :, :L], mask
+            )
             h = layer.norm1(h + self._out(sa, a))
 
             ca = layer.multihead_attn
@@ -148,18 +163,26 @@ class TagDecoder:
 
     @torch.no_grad()
     def _capture(self):
+        graphs = []
         with self._device_context():
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                for _ in range(3):  # warm-up, as required before capture
-                    self._step()
-            torch.cuda.current_stream().wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            # thread_local: other docling stages may use the GPU from other threads
-            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
-                self._step()
-        self._graph = graph
+            for L in self._buckets:
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    self._t.zero_()
+                    for _ in range(3):  # warm-up, as required before capture
+                        self._step(L)
+                torch.cuda.current_stream().wait_stream(stream)
+                self._t.zero_()
+                graph = torch.cuda.CUDAGraph()
+                # thread_local: other docling stages may use the GPU from other threads
+                with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+                    # DCC_TABLES_DECODER: _chunk steps per graph (one launch per
+                    # check of the end flag instead of one per token)
+                    for _ in range(self._chunk if self._fast else 1):
+                        self._step(L)
+                graphs.append(graph)
+        self._graphs = graphs
 
     @torch.no_grad()
     def decode(self, memory: Tensor, max_steps: int, check_every: int = 8):
@@ -213,11 +236,46 @@ class TagDecoder:
             flag = flag.pin_memory()
         event = None
         steps = max_steps
+        K = self._chunk
+        if (
+            self._fast
+            and self._graphs is not None
+            and check_every == K
+            and max_steps % K == 0
+            and all(b % K == 0 for b in self._buckets)
+        ):
+            # K steps per replay; the same end checks as the loop below (every K
+            # steps, reading the flag copied at the previous check)
+            bucket = 0
+            for t0 in range(0, max_steps, K):
+                while t0 >= self._buckets[bucket]:
+                    bucket += 1
+                self._graphs[bucket].replay()
+                if event is not None:
+                    event.synchronize()
+                    if bool(flag):
+                        steps = t0 + K
+                        break
+                flag.copy_(self._all_finished, non_blocking=True)
+                event = torch.cuda.Event(blocking=True)
+                event.record()
+            done = torch.cuda.Event(blocking=True)
+            done.record()
+            done.synchronize()
+            steps = min(steps, max_steps)
+            tags = self._tags[: steps + 1, :n].T.tolist()
+            lengths = self._lengths[:n].tolist()
+            seqs = [row[: 1 + min(length, steps)] for row, length in zip(tags, lengths)]
+            return seqs, self._hidden[:steps, :n]
+
+        bucket = 0
         for t in range(max_steps):
-            if self._graph is not None:
-                self._graph.replay()
+            while t >= self._buckets[bucket]:
+                bucket += 1
+            if self._graphs is not None:
+                self._graphs[bucket].replay()
             else:
-                self._step()
+                self._step(self._buckets[bucket])
             if not on_cuda:
                 if bool(self._all_finished):
                     steps = t + 1
@@ -232,9 +290,14 @@ class TagDecoder:
                         steps = t + 1
                         break
                 flag.copy_(self._all_finished, non_blocking=True)
-                event = torch.cuda.Event()
+                # blocking: the thread sleeps instead of spinning on a CPU core
+                event = torch.cuda.Event(blocking=self._fast)
                 event.record()
 
+        if on_cuda and self._fast:
+            done = torch.cuda.Event(blocking=True)
+            done.record()
+            done.synchronize()
         steps = min(steps, max_steps)
         tags = self._tags[: steps + 1, :n].T.tolist()
         lengths = self._lengths[:n].tolist()

@@ -6,6 +6,7 @@ import numpy as np
 
 import docling_ibm_models.tableformer.otsl as otsl
 import docling_ibm_models.tableformer.settings as s
+from docling_ibm_models.tableformer.dcc_flags import on as _dcc_on
 
 # LOG_LEVEL = logging.INFO
 # LOG_LEVEL = logging.DEBUG
@@ -77,6 +78,30 @@ def find_intersection(b1, b2):
     return i_bbox
 
 
+def _copy_tokens(tokens):
+    r"""
+    Copy of the pdf tokens for matching: what copy.deepcopy gives for tokens with
+    "id", "text" and a "bbox" dict or list, without its generic recursion.
+    """
+    out = []
+    for token in tokens:
+        new = {}
+        for k, v in token.items():
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                new[k] = v
+            elif k == "bbox" and isinstance(v, dict):
+                new[k] = {
+                    bk: bv if isinstance(bv, (str, int, float)) else copy.deepcopy(bv)
+                    for bk, bv in v.items()
+                }
+            elif k == "bbox" and isinstance(v, list):
+                new[k] = list(v)
+            else:
+                new[k] = copy.deepcopy(v)
+        out.append(new)
+    return out
+
+
 class CellMatcher:
     r"""
     Match the table cells to the pdf page cells.
@@ -126,7 +151,10 @@ class CellMatcher:
         matching_details : dict
             Dictionary with all details about the mathings between the table and pdf cells
         """
-        pdf_cells = copy.deepcopy(iocr_page["tokens"])
+        if _dcc_on("MATCH"):
+            pdf_cells = _copy_tokens(iocr_page["tokens"])
+        else:
+            pdf_cells = copy.deepcopy(iocr_page["tokens"])
         if len(pdf_cells) > 0:
             for word in pdf_cells:
                 if isinstance(word["bbox"], list):
@@ -484,6 +512,109 @@ class CellMatcher:
             of the table_cells that fall inside that pdf cell
         int
             Number of total matches
+        """
+        if not _dcc_on("MATCH"):
+            return self._intersection_over_pdf_match_loop(table_cells, pdf_cells)
+        if len(table_cells) == 0 or len(pdf_cells) == 0:
+            return {}, 0
+        # A later table cell with the same cell_id and bbox as an earlier one
+        # (the post-processor repeats a cell once per match) only produces matches
+        # that the loop's duplicate check drops: leave it out
+        seen = {}
+        unique_cells = []
+        for cell in table_cells:
+            first = seen.get(cell["cell_id"])
+            if first is None:
+                seen[cell["cell_id"]] = [cell]
+                unique_cells.append(cell)
+            elif not any(f is cell or f["bbox"] == cell["bbox"] for f in first):
+                first.append(cell)
+                unique_cells.append(cell)
+        table_cells = unique_cells
+        # All pairs at once with numpy: the same float64 operations as
+        # find_intersection on Python floats, so the same iopdf values. NaN
+        # coordinates (where Python's min/max differ from numpy's) and odd shapes
+        # take the original loop.
+        try:
+            t = np.asarray([c["bbox"] for c in table_cells], dtype=np.float64)
+            p = np.asarray([c["bbox"] for c in pdf_cells], dtype=np.float64)
+        except (TypeError, ValueError):
+            t = p = None
+        if (
+            t is None
+            or t.ndim != 2
+            or p.ndim != 2
+            or t.shape[1] != 4
+            or p.shape[1] != 4
+            or np.isnan(t).any()
+            or np.isnan(p).any()
+        ):
+            return self._intersection_over_pdf_match_loop(table_cells, pdf_cells)
+
+        p_areas = (p[:, 2] - p[:, 0]) * (p[:, 3] - p[:, 1])
+        # Candidate pairs: pdf cells whose top lies in [t1 - max height - 1, t3]
+        # (a superset of the y overlaps; the margin covers rounding), found
+        # by binary search on the pdf cells sorted by top. Then the exact tests.
+        order = np.argsort(p[:, 1], kind="stable")
+        tops = p[order, 1]
+        h_max = max(float(np.max(p[:, 3] - p[:, 1])), 0.0) + 1.0
+        lo = np.searchsorted(tops, t[:, 1] - h_max, side="left")
+        hi = np.searchsorted(tops, t[:, 3], side="right")
+        n = np.maximum(hi - lo, 0)
+        ii = np.repeat(np.arange(len(t)), n)
+        starts = np.repeat(np.cumsum(n) - n, n)
+        jj = order[np.repeat(lo, n) + np.arange(int(n.sum())) - starts]
+        tc, pc = t[ii], p[jj]
+        keep = ~(
+            (tc[:, 2] < pc[:, 0])
+            | (pc[:, 2] < tc[:, 0])
+            | (tc[:, 1] > pc[:, 3])
+            | (pc[:, 1] > tc[:, 3])
+        )
+        ii, jj, tc, pc = ii[keep], jj[keep], tc[keep], pc[keep]
+        srt = np.lexsort((jj, ii))  # the (table cell, pdf cell) order of the loop
+        ii, jj, tc, pc = ii[srt], jj[srt], tc[srt], pc[srt]
+        # Same operations as find_intersection and the loop below, per pair
+        i_area = (np.minimum(tc[:, 2], pc[:, 2]) - np.maximum(tc[:, 0], pc[:, 0])) * (
+            np.minimum(tc[:, 3], pc[:, 3]) - np.maximum(tc[:, 1], pc[:, 1])
+        )
+        pa = p_areas[jj]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            iopdf = np.where(pa > 0, i_area / np.where(pa > 0, pa, 1), 0)
+        keep = iopdf > 0
+        ii, jj, iopdf = ii[keep].tolist(), jj[keep].tolist(), iopdf[keep].tolist()
+
+        # key: pdf_cell_id, value: list of TableCell that fall inside that pdf_cell
+        matches = {}
+        matches_counter = 0
+        tids = [c["cell_id"] for c in table_cells]
+        pids = [c["id"] for c in pdf_cells]
+        if len(set(tids)) == len(tids) and len(set(pids)) == len(pids):
+            # Unique ids: no pair can repeat a match, so skip the list scans
+            for i, j, v in zip(ii, jj, iopdf):
+                match = {"table_cell_id": tids[i], "iopdf": v}
+                lst = matches.get(pids[j])
+                if lst is None:
+                    matches[pids[j]] = [match]
+                else:
+                    lst.append(match)
+            return matches, len(ii)
+        for i, j, v in zip(ii, jj, iopdf):  # row-major: the order of the loop
+            pdf_cell_id = pdf_cells[j]["id"]
+            match = {"table_cell_id": table_cells[i]["cell_id"], "iopdf": v}
+            if pdf_cell_id not in matches:
+                matches[pdf_cell_id] = [match]
+                matches_counter += 1
+            else:
+                # Check if the same match was not already counted
+                if match not in matches[pdf_cell_id]:
+                    matches[pdf_cell_id].append(match)
+                    matches_counter += 1
+        return matches, matches_counter
+
+    def _intersection_over_pdf_match_loop(self, table_cells, pdf_cells):
+        r"""
+        Reference implementation of _intersection_over_pdf_match (Python loops).
         """
         pdf_bboxes = np.asarray([p["bbox"] for p in pdf_cells])
         pdf_bboxes_areas = (pdf_bboxes[:, 2] - pdf_bboxes[:, 0]) * (
