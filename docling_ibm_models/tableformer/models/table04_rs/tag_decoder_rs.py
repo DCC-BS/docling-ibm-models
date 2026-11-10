@@ -1,12 +1,12 @@
 import contextlib
 import threading
+import weakref
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from docling_ibm_models.tableformer.dcc_flags import on as _dcc_on
 
 
 def _attend_one(q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None):
@@ -38,7 +38,7 @@ class TagDecoder:
     Not thread safe: TableModel04_rs serialises the calls.
     """
 
-    def __init__(self, model, batch_size: int, max_steps: int, use_cuda_graph: bool):
+    def __init__(self, model, batch_size: int, max_steps: int, use_cuda_graph: bool, fast: bool = True):
         tt = model._tag_transformer
         self._tt = tt
         self._layers = list(tt._decoder.layers)
@@ -84,7 +84,7 @@ class TagDecoder:
         # L: one step function (and CUDA graph) per cache length bucket, so short
         # tables do not pay for attention over the whole max_steps cache
         # (DCC_TABLES_DECODER; off: one bucket of max_steps, the original decoder)
-        self._fast = _dcc_on("DECODER")
+        self._fast = fast
         if self._fast:
             self._buckets = sorted({min(b, T) for b in (64, 128, 256, 512)} | {T})
         else:
@@ -307,25 +307,35 @@ class TagDecoder:
 
 class TagDecoders:
     r"""
-    One TagDecoder per batch size (powers of two up to max_batch_size), built on
-    first use. A failed CUDA graph capture falls back to running the steps eagerly.
+    The TagDecoder of a model, built on first use for ``max_batch_size`` tables. A failed CUDA
+    graph capture falls back to running the steps eagerly.
+
+    Every call decodes with that one batch size, smaller batches padded: on the GPU a matrix
+    product's result can depend on its shape, so a table decoded with other batch sizes could
+    get other tags depending on which tables happen to share its batch.
+
+    The model is held weakly: the model holds this object, and a strong reference back
+    would make a cycle that only the cyclic garbage collector frees (never, once the model
+    has been frozen with ``gc.freeze``).
     """
 
-    def __init__(self, model, max_steps: int, max_batch_size: int = 4):
-        self._model = model
+    def __init__(self, model, max_steps: int, max_batch_size: int = 4, fast: bool = True):
+        self._model = weakref.ref(model)
         self._max_steps = max_steps
         self.max_batch_size = max_batch_size
-        self._decoders: dict[int, TagDecoder] = {}
+        self.fast = fast
+        self._decoder: Optional[TagDecoder] = None
         self.lock = threading.Lock()
 
-    def get(self, n: int) -> TagDecoder:
-        size = 1
-        while size < n:
-            size *= 2
-        if size not in self._decoders:
+    def get(self) -> TagDecoder:
+        """The decoder; call with ``lock`` held."""
+        if self._decoder is None:
+            model = self._model()
+            if model is None:
+                raise RuntimeError("the TableFormer model of these decoders was freed")
+            args = (model, self.max_batch_size, self._max_steps)
             try:
-                decoder = TagDecoder(self._model, size, self._max_steps, True)
+                self._decoder = TagDecoder(*args, True, fast=self.fast)
             except RuntimeError:
-                decoder = TagDecoder(self._model, size, self._max_steps, False)
-            self._decoders[size] = decoder
-        return self._decoders[size]
+                self._decoder = TagDecoder(*args, False, fast=self.fast)
+        return self._decoder

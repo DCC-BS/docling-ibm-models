@@ -7,6 +7,18 @@
 [![Models on Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-blue)](https://huggingface.co/ds4sd/docling-models/)
 [![License MIT](https://img.shields.io/github/license/ds4sd/deepsearch-toolkit)](https://opensource.org/licenses/MIT)
 
+> **DCC build (`dcc/v4.0.4`, version `4.0.4+dcc.1`).** A short-lived fork of docling-ibm-models 4.0.4 for
+> the DCC docling-serve image, released as wheels on this repository's GitHub releases (not on PyPI).
+> It adds TableFormer v1 speed-ups that give the same tables:
+>
+> - the tag decoder with a KV cache and a CUDA graph, upstream [docling-project/docling-ibm-models#210](https://github.com/docling-project/docling-ibm-models/pull/210);
+> - faster cell matching, 8 decoder steps per graph replay, normalisation by lookup table
+>   (`DCC_TABLES_MATCH`, `DCC_TABLES_DECODER`, `DCC_TABLES_PREP`; each `=0` runs the upstream code path);
+> - every decode batch padded to `DCC_TABLES_MAXB` tables (default 4), so a table decodes the same
+>   whatever shares its batch.
+>
+> The fork ends when upstream releases #210; then the image goes back to the PyPI release.
+
 # Docling IBM models
 
 AI modules to support the Docling PDF document conversion project.

@@ -1,5 +1,5 @@
 import logging
-import os
+import threading
 
 import torch
 import torch.nn as nn
@@ -14,6 +14,7 @@ from docling_ibm_models.tableformer.models.table04_rs.tag_decoder_rs import (
 from docling_ibm_models.tableformer.models.table04_rs.transformer_rs import (
     Tag_Transformer,
 )
+from docling_ibm_models.tableformer.dcc_flags import int_env
 from docling_ibm_models.tableformer.dcc_flags import on as _dcc_on
 from docling_ibm_models.tableformer.utils.app_profiler import AggProfiler
 
@@ -21,6 +22,9 @@ LOG_LEVEL = logging.WARN
 # LOG_LEVEL = logging.INFO
 # LOG_LEVEL = logging.DEBUG
 
+
+# Building the decoders of a model once, also when two threads call it first
+_DECODERS_LOCK = threading.Lock()
 
 class TableModel04_rs(BaseModel, nn.Module):
     r"""
@@ -155,27 +159,33 @@ class TableModel04_rs(BaseModel, nn.Module):
         AggProfiler().begin("predict_total", self._prof)
         self._tag_transformer.eval()
         max_steps = min(max_steps, self._max_pred_len)
-        if self._tag_decoders is None:
-            # DCC_TABLES_MAXB: tables decoded together (default 4, as before)
-            maxb = int(os.environ.get("DCC_TABLES_MAXB", "4") or 4)
-            self._tag_decoders = TagDecoders(self, self._max_pred_len, maxb)
-        decoders = self._tag_decoders
+        decoders = self._decoders()
 
         results = []
-        with decoders.lock:
-            for s in range(0, imgs.size(0), decoders.max_batch_size):
-                chunk = imgs[s : s + decoders.max_batch_size]
-                # The encoders run per table: batching the CNN changes the
-                # results by more than float noise (different conv kernels)
-                encoded = [self._encode(chunk[i : i + 1]) for i in range(chunk.size(0))]
-                memory = torch.cat([m for _, m in encoded], dim=1)
+        for s in range(0, imgs.size(0), decoders.max_batch_size):
+            chunk = imgs[s : s + decoders.max_batch_size]
+            # The encoders run per table: batching the CNN changes the
+            # results by more than float noise (different conv kernels)
+            encoded = [self._encode(chunk[i : i + 1]) for i in range(chunk.size(0))]
+            memory = torch.cat([m for _, m in encoded], dim=1)
+            # The decoder's buffers are shared: hold the lock until its output is read
+            with decoders.lock:
                 AggProfiler().begin("model_tag_transformer_decoder", self._prof)
-                seqs, hidden = decoders.get(chunk.size(0)).decode(memory, max_steps)
+                seqs, hidden = decoders.get().decode(memory, max_steps)
                 AggProfiler().end("model_tag_transformer_decoder", self._prof)
                 for i, seq in enumerate(seqs):
                     results.append(self._table_output(seq, hidden[:, i], encoded[i][0]))
         AggProfiler().end("predict_total", self._prof)
         return results
+
+    def _decoders(self) -> TagDecoders:
+        """The tag decoders, built once; DCC_TABLES_MAXB tables decoded together (default 4)."""
+        with _DECODERS_LOCK:
+            if self._tag_decoders is None:
+                self._tag_decoders = TagDecoders(
+                    self, self._max_pred_len, int_env("MAXB", 4), fast=_dcc_on("DECODER")
+                )
+            return self._tag_decoders
 
     def _encode(self, img):
         r"""
@@ -233,7 +243,7 @@ class TableModel04_rs(BaseModel, nn.Module):
         # Merge First and Last predicted BBOX for each span, according to bboxes_to_merge
         ########################################################################################
 
-        if _dcc_on("DECODER"):
+        if self._tag_decoders is not None and self._tag_decoders.fast:
             outputs_class1, outputs_coord1 = self._merge_span_bboxes(
                 outputs_class, outputs_coord, bboxes_to_merge
             )

@@ -11,3 +11,12 @@ _DEFAULTS = {"MATCH": "1", "DECODER": "1", "PREP": "1", "RESIZE": "0"}
 
 def on(name: str) -> bool:
     return os.environ.get(f"DCC_TABLES_{name}", _DEFAULTS.get(name, "0")) == "1"
+
+
+def int_env(name: str, default: int, minimum: int = 1) -> int:
+    """``DCC_TABLES_<name>`` as an int of at least ``minimum``; ``default`` when unset, empty or not a number."""
+    try:
+        value = int(os.environ.get(f"DCC_TABLES_{name}", "").strip())
+    except ValueError:
+        return default
+    return max(minimum, value)

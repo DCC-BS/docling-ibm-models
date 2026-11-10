@@ -164,7 +164,7 @@ def test_cuda_graph_matches_eager(predictor, images):
         )
     graph = TagDecoder(model, 4, 1024, use_cuda_graph=True)
     eager = TagDecoder(model, 4, 1024, use_cuda_graph=False)
-    assert graph._graph is not None
+    assert graph._graphs is not None
     seqs, hidden = graph.decode(memory, 1024)
     hidden = hidden.clone()
     eager_seqs, eager_hidden = eager.decode(memory, 1024)
